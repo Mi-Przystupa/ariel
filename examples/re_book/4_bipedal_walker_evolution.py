@@ -117,7 +117,6 @@ LEARNING_POP: int = args.lr_pop
 NUM_WORKERS: int = args.workers
 MAX_MODULES_PER_LEG: int = 10
 HIDDEN_SIZE: int = 32
-Z_CRASH_THRESHOLD: float = 0.05
 CONTROL_STEP_FREQ: int = 50
 
 SPAWN_POSITION = (0.0, 0.0, 0.1)
@@ -200,35 +199,40 @@ def count_parameters(net: nn.Module) -> int:
 def random_bipedal_tree(max_modules_per_leg: int = MAX_MODULES_PER_LEG) -> TreeGenome:
     """Generate a tree genome with exactly 2 limbs from core (LEFT, RIGHT).
 
-    Each leg is a chain of alternating HINGE and BRICK modules.
+    Each leg has a structured joint layout: alternating HINGE and BRICK modules
+    with mixed rotations (DEG_0, DEG_90) so the leg can bend in multiple planes.
+    This is essential for standing — without rotation diversity the legs extend
+    flat and the robot just lies on the ground like a snake.
+
+    The base pattern is hip(DEG_0)→brick→knee(DEG_90)→brick→ankle(DEG_0)→brick,
+    optionally extended with more joints for longer legs.
     """
     g = TreeGenome()
     g.nodes = {IDX_OF_CORE: {"type": "CORE", "rotation": "DEG_0"}}
     g.edges = []
 
     leg_faces = ["LEFT", "RIGHT"]
+    # Rotation pattern for hinges: alternate 0/90 so legs can bend downward
+    hinge_rotations = ["DEG_0", "DEG_90", "DEG_0", "DEG_90", "DEG_0"]
     next_id = 1
 
     for face in leg_faces:
-        leg_length = random.randint(2, max_modules_per_leg)
+        # Each leg: 3-5 joints (6-10 modules total: hinge-brick pairs)
+        num_joints = random.randint(3, min(5, max_modules_per_leg // 2))
         parent_id = IDX_OF_CORE
         parent_face = face
 
-        for i in range(leg_length):
-            # Alternate HINGE and BRICK for articulated legs
-            if i % 2 == 0:
-                mtype = "HINGE"
-            else:
-                mtype = "BRICK"
-
-            rotations = [
-                r.name for r in ALLOWED_ROTATIONS[ModuleType[mtype]]
-            ]
-            rot = random.choice(rotations)
-
-            add_node(g, parent_id, parent_face, next_id, mtype, rot)
+        for j in range(num_joints):
+            # HINGE with structured rotation
+            rot = hinge_rotations[j % len(hinge_rotations)]
+            add_node(g, parent_id, parent_face, next_id, "HINGE", rot)
             parent_id = next_id
-            # HINGE only has FRONT; BRICK can chain via FRONT
+            parent_face = "FRONT"
+            next_id += 1
+
+            # BRICK spacer
+            add_node(g, parent_id, parent_face, next_id, "BRICK", "DEG_0")
+            parent_id = next_id
             parent_face = "FRONT"
             next_id += 1
 
@@ -243,8 +247,8 @@ def is_bipedal(genome: TreeGenome) -> bool:
     return len(core_children) == 2
 
 
-MIN_MODULES_PER_LEG = 3   # at least hinge-brick-hinge per leg
-MIN_HINGES_PER_LEG = 2    # need at least 2 joints to walk
+MIN_MODULES_PER_LEG = 6   # at least 3 hinge-brick pairs per leg
+MIN_HINGES_PER_LEG = 3    # need at least 3 joints (hip/knee/ankle) to stand
 
 
 def validate_morphology(genome: TreeGenome) -> str | None:
@@ -303,15 +307,25 @@ def validate_spawned_robot(ind: Individual) -> str | None:
     if model.nu == 0:
         return "no actuators"
 
-    # Run for 0.5s with zero control to check passive stability
+    # Run for 0.5s with zero control to check if core contacts floor
     mujoco.mj_resetData(model, data)
+    floor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    core_id = -1
+    for i in range(model.ngeom):
+        if "core" in model.geom(i).name:
+            core_id = i
+            break
+
     steps = int(0.5 / model.opt.timestep)
     for _ in range(steps):
         mujoco.mj_step(model, data)
 
-    core_z = data.qpos[2]
-    if core_z < Z_CRASH_THRESHOLD:
-        return f"core hits ground passively (z={core_z:.3f})"
+    # Check for core-floor contact
+    for ci in range(data.ncon):
+        c = data.contact[ci]
+        pair = {c.geom1, c.geom2}
+        if floor_id in pair and core_id in pair:
+            return "core contacts floor passively"
 
     return None
 
@@ -367,54 +381,66 @@ def get_joint_count(ind: Individual) -> int:
 
 def bipedal_fitness(
     trajectory: list,
+    head_crashed: bool = False,
 ) -> float:
     """Composite fitness for bipedal walker (minimization: lower is better).
 
     Components
     ----------
-    1. Hard crash: core z drops below crash threshold → +10 penalty
+    1. Core-floor contact detected → +10 penalty (episode ended early)
     2. Forward distance: reward moving forward (negative = good)
     3. Head height: reward being tall (core lifted off ground)
     4. Head height × forward distance: reward tall + moving
     5. Head velocity penalty: penalize jerky/unstable heads
 
     The fitness is designed so that CMA-ES always has a gradient:
-    - Standing still at z=0.10 scores ~0 (neutral)
+    - Standing still at resting height scores ~0 (neutral)
     - Lifting core higher scores negative (good)
-    - Moving forward scores negative (good)
-    - Crashing scores +10 (bad)
+    - Moving forward while standing scores negative (good)
+    - Core touching floor scores +10 (bad)
     """
     if not trajectory or len(trajectory) < 2:
         return 999.0
 
+    if head_crashed:
+        return 10.0
+
     positions = np.array(trajectory)
 
-    # Hard crash: core hit the floor
-    min_z = positions[:, 2].min()
-    if min_z < Z_CRASH_THRESHOLD:
-        return 10.0
+    # Resting z = first reading (after warmup settle)
+    resting_z = positions[0, 2]
+
+    # Must lift at least 4cm above resting to count as "standing"
+    standing_threshold = resting_z + 0.04
+
+    # Average height above resting position
+    avg_z = positions[:, 2].mean()
+    avg_height_above_rest = max(avg_z - resting_z, 0.0)
 
     # Forward distance (x-axis)
     forward_dist = positions[-1, 0] - positions[0, 0]
 
-    # Head height reward: how high is the core above resting position?
-    # Resting z ≈ 0.10 (core sitting on floor). Reward lifting above this.
-    resting_z = 0.10
-    avg_height_above_rest = max(positions[:, 2].mean() - resting_z, 0.0)
+    # STANDING REWARD: the primary objective is to stand up first.
+    # This is weighted heavily so evolution prioritizes height over crawling.
+    standing_reward = avg_height_above_rest * 10.0
 
-    # Height × forward distance (reward being tall AND moving)
-    height_reward = avg_height_above_rest * max(forward_dist, 0.0)
+    # FORWARD DISTANCE: only rewarded when actually standing.
+    # If core is at resting height, forward movement = snake behavior = no reward.
+    if avg_z > standing_threshold:
+        forward_reward = max(forward_dist, 0.0)
+        # Bonus: height × distance (tall walkers that also move)
+        combined_reward = avg_height_above_rest * max(forward_dist, 0.0)
+    else:
+        forward_reward = 0.0
+        combined_reward = 0.0
 
-    # Head velocity penalty (stability)
+    # Head velocity penalty (stability — penalize jerky movement)
     velocities = np.diff(positions, axis=0)
     head_speed = np.linalg.norm(velocities, axis=1)
-    velocity_penalty = head_speed.mean() * 0.1
-
-    # Pure height reward: even if not moving, reward standing tall
-    height_only = avg_height_above_rest * 5.0
+    velocity_penalty = head_speed.mean() * 0.05
 
     # Minimize: lower is better
-    fitness = -forward_dist - height_reward - height_only + velocity_penalty
+    fitness = -standing_reward - forward_reward - combined_reward + velocity_penalty
     return float(fitness)
 
 
@@ -477,8 +503,9 @@ def run_simulation(
     # 5. Run simulation
     mujoco.mj_resetData(model, data)
 
+    crashed = False
     if mode == "simple":
-        _run_headless(model, data, network, tracker)
+        crashed = _run_headless(model, data, network, tracker)
     elif mode == "launcher":
         # For viewer, use control callback
         current_ctrl = np.zeros(model.nu)
@@ -535,7 +562,7 @@ def run_simulation(
 
     first_key = next(iter(tracker.history["xpos"].keys()))
     traj = tracker.history["xpos"][first_key]
-    return bipedal_fitness(traj)
+    return bipedal_fitness(traj, head_crashed=crashed)
 
 
 def _run_headless(
@@ -557,6 +584,14 @@ def _run_headless(
     warmup_steps = int(0.5 / timestep)
     for _ in range(warmup_steps):
         mujoco.mj_step(model, data)
+
+    # Find geom IDs for floor and core to detect contact
+    floor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    core_id = -1
+    for i in range(model.ngeom):
+        if "core" in model.geom(i).name:
+            core_id = i
+            break
 
     # Initial tracker reading (after warmup)
     tracker.update(data)
@@ -581,11 +616,15 @@ def _run_headless(
             # Update tracker at control frequency
             tracker.update(data)
 
-            # Check head/core z-height (crash = core hit the floor)
-            first_key = next(iter(tracker.history["xpos"].keys()))
-            traj = tracker.history["xpos"][first_key]
-            if traj and traj[-1][2] < Z_CRASH_THRESHOLD:
-                head_crashed = True
+            # Check for core-floor contact (head hit ground)
+            if core_id >= 0:
+                for ci in range(data.ncon):
+                    c = data.contact[ci]
+                    pair = {c.geom1, c.geom2}
+                    if floor_id in pair and core_id in pair:
+                        head_crashed = True
+                        break
+            if head_crashed:
                 break
 
         data.ctrl[:] = current_ctrl
@@ -677,14 +716,14 @@ def learn_brain(
         tracker.setup(world.spec, data)
         mujoco.mj_resetData(model, data)
 
-        _run_headless(model, data, net, tracker)
+        crashed = _run_headless(model, data, net, tracker)
 
         if not tracker.history["xpos"]:
             return 999.0
 
         first_key = next(iter(tracker.history["xpos"].keys()))
         traj = tracker.history["xpos"][first_key]
-        return bipedal_fitness(traj)
+        return bipedal_fitness(traj, head_crashed=crashed)
 
     # Setup CMA-ES via EvoTorch
     problem = NEProblem(
