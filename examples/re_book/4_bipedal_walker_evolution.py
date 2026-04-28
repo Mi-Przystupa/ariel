@@ -372,17 +372,24 @@ def bipedal_fitness(
 
     Components
     ----------
-    1. Head/core ground contact: +10.0 penalty (episode terminated early)
-    2. Forward distance: negative reward (more forward = lower score)
-    3. Head height * forward distance: reward tall + moving walkers
-    4. Head velocity penalty: penalize jerky/unstable heads
+    1. Hard crash: core z drops below crash threshold → +10 penalty
+    2. Forward distance: reward moving forward (negative = good)
+    3. Head height: reward being tall (core lifted off ground)
+    4. Head height × forward distance: reward tall + moving
+    5. Head velocity penalty: penalize jerky/unstable heads
+
+    The fitness is designed so that CMA-ES always has a gradient:
+    - Standing still at z=0.10 scores ~0 (neutral)
+    - Lifting core higher scores negative (good)
+    - Moving forward scores negative (good)
+    - Crashing scores +10 (bad)
     """
     if not trajectory or len(trajectory) < 2:
         return 999.0
 
     positions = np.array(trajectory)
 
-    # Check for head/core ground contact
+    # Hard crash: core hit the floor
     min_z = positions[:, 2].min()
     if min_z < Z_CRASH_THRESHOLD:
         return 10.0
@@ -390,19 +397,24 @@ def bipedal_fitness(
     # Forward distance (x-axis)
     forward_dist = positions[-1, 0] - positions[0, 0]
 
-    # Average head height
-    avg_head_height = positions[:, 2].mean()
+    # Head height reward: how high is the core above resting position?
+    # Resting z ≈ 0.10 (core sitting on floor). Reward lifting above this.
+    resting_z = 0.10
+    avg_height_above_rest = max(positions[:, 2].mean() - resting_z, 0.0)
 
-    # Height * forward distance reward (only positive forward)
-    height_reward = avg_head_height * max(forward_dist, 0.0)
+    # Height × forward distance (reward being tall AND moving)
+    height_reward = avg_height_above_rest * max(forward_dist, 0.0)
 
     # Head velocity penalty (stability)
     velocities = np.diff(positions, axis=0)
     head_speed = np.linalg.norm(velocities, axis=1)
     velocity_penalty = head_speed.mean() * 0.1
 
+    # Pure height reward: even if not moving, reward standing tall
+    height_only = avg_height_above_rest * 5.0
+
     # Minimize: lower is better
-    fitness = -forward_dist - height_reward + velocity_penalty
+    fitness = -forward_dist - height_reward - height_only + velocity_penalty
     return float(fitness)
 
 
@@ -541,7 +553,15 @@ def _run_headless(
     current_ctrl = np.zeros(model.nu)
     head_crashed = False
 
-    for step in range(total_steps):
+    # Warmup: let physics settle for 0.5s before tracking/control
+    warmup_steps = int(0.5 / timestep)
+    for _ in range(warmup_steps):
+        mujoco.mj_step(model, data)
+
+    # Initial tracker reading (after warmup)
+    tracker.update(data)
+
+    for step in range(total_steps - warmup_steps):
         # Control step
         if step % CONTROL_STEP_FREQ == 0:
             robot_state = get_robot_state(data)
@@ -561,13 +581,12 @@ def _run_headless(
             # Update tracker at control frequency
             tracker.update(data)
 
-            # Check head/core z-height
-            if tracker.history["xpos"]:
-                first_key = next(iter(tracker.history["xpos"].keys()))
-                traj = tracker.history["xpos"][first_key]
-                if traj and traj[-1][2] < Z_CRASH_THRESHOLD:
-                    head_crashed = True
-                    break
+            # Check head/core z-height (crash = core hit the floor)
+            first_key = next(iter(tracker.history["xpos"].keys()))
+            traj = tracker.history["xpos"][first_key]
+            if traj and traj[-1][2] < Z_CRASH_THRESHOLD:
+                head_crashed = True
+                break
 
         data.ctrl[:] = current_ctrl
         mujoco.mj_step(model, data)
